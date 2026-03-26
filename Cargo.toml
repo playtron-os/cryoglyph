@@ -8,7 +8,7 @@ repository = "https://github.com/iced-rs/cryoglyph"
 license = "MIT OR Apache-2.0 OR Zlib"
 
 [dependencies]
-wgpu = { git = "https://github.com/playtron-os/wgpu.git", rev = "3bcea5903", default-features = false, features = ["wgsl"] }
+wgpu = { git = "https://github.com/playtron-os/wgpu.git", rev = "f28c5f92e", default-features = false, features = ["wgsl"] }
 etagere = "0.2"
 cosmic-text = { git = "https://github.com/playtron-os/cosmic-text.git", rev = "f1ef5fe3" }
 lru = { version = "0.16", default-features = false }
