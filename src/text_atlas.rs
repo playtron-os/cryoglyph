@@ -1,15 +1,12 @@
-use crate::{
-    Cache, CacheKey, FontSystem, GlyphDetails, GpuCacheStatus, SwashCache, text_render::ContentType,
-};
+use crate::{Cache, CacheKey, FontSystem, GlyphDetails, SwashCache, text_render::ContentType};
 use etagere::{Allocation, BucketedAtlasAllocator, size2};
 use lru::LruCache;
 use rustc_hash::FxHasher;
 use std::{collections::HashSet, hash::BuildHasherDefault};
 use wgpu::{
     BindGroup, DepthStencilState, Device, Extent3d, MultisampleState, Origin3d, Queue,
-    RenderPipeline, TexelCopyBufferLayout, TexelCopyTextureInfo, Texture, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor,
+    RenderPipeline, TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
 };
 
 type Hasher = BuildHasherDefault<FxHasher>;
@@ -27,11 +24,25 @@ pub(crate) struct InnerAtlas {
 }
 
 impl InnerAtlas {
-    const INITIAL_SIZE: u32 = 256;
-
     fn new(device: &Device, _queue: &Queue, kind: Kind) -> Self {
         let max_texture_dimension_2d = device.limits().max_texture_dimension_2d;
-        let size = Self::INITIAL_SIZE.min(max_texture_dimension_2d);
+
+        // Start the atlas large enough to hold a realistic working set without
+        // LRU eviction — evicting then re-rasterizing glyphs on the render
+        // thread (via swash) was a major scroll-stall source, and the original
+        // 256² filled almost immediately (one screen of the thread list is
+        // ~400 unique glyphs, more with CJK). The mask atlas (regular text,
+        // 1 byte/px) does the heavy lifting and gets the most room; the color
+        // atlas (emoji, 4 bytes/px) holds very few glyphs, so keep it small to
+        // avoid wasting VRAM. Growth is now a cheap GPU blit (see `grow`), so
+        // these are just sensible starting points, not hard caps.
+        //   mask  1024² → ~1 MB,  ~thousands of glyphs
+        //   color  512² → ~1 MB
+        let initial_size = match kind {
+            Kind::Mask => 1024,
+            Kind::Color { .. } => 512,
+        };
+        let size = initial_size.min(max_texture_dimension_2d);
 
         let packer = BucketedAtlasAllocator::new(size2(size as i32, size as i32));
 
@@ -47,7 +58,9 @@ impl InnerAtlas {
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: kind.texture_format(),
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -111,8 +124,8 @@ impl InnerAtlas {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        font_system: &mut FontSystem,
-        cache: &mut SwashCache,
+        _font_system: &mut FontSystem,
+        _cache: &mut SwashCache,
     ) -> bool {
         if self.size >= self.max_texture_dimension_2d {
             return false;
@@ -121,12 +134,17 @@ impl InnerAtlas {
         // Grow each dimension by a factor of 2. The growth factor was chosen to match the growth
         // factor of `Vec`.`
         const GROWTH_FACTOR: u32 = 2;
+        let old_size = self.size;
         let new_size = (self.size * GROWTH_FACTOR).min(self.max_texture_dimension_2d);
 
+        // `BucketedAtlasAllocator::grow` preserves the coordinates of existing
+        // allocations, so every cached glyph stays at the same (x, y) in the
+        // larger atlas.
         self.packer.grow(size2(new_size as i32, new_size as i32));
 
-        // Create a texture to use for our atlas
-        self.texture = device.create_texture(&TextureDescriptor {
+        // Create the new, larger atlas texture. `COPY_SRC` is added so that a
+        // *future* grow can use this texture as the blit source.
+        let new_texture = device.create_texture(&TextureDescriptor {
             label: Some("glyphon atlas"),
             size: Extent3d {
                 width: new_size,
@@ -137,47 +155,43 @@ impl InnerAtlas {
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: self.kind.texture_format(),
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
-        // Re-upload glyphs
-        for (&cache_key, glyph) in &self.glyph_cache {
-            let (x, y) = match glyph.gpu_cache {
-                GpuCacheStatus::InAtlas { x, y, .. } => (x, y),
-                GpuCacheStatus::SkipRasterization => continue,
-            };
+        // Preserve existing glyphs with a single GPU texture-to-texture blit
+        // instead of re-rasterizing every cached glyph on the CPU (via swash)
+        // and re-uploading them one by one. The old approach could stall the
+        // render thread for hundreds of milliseconds on glyph-heavy / CJK
+        // content — every time the atlas filled up while scrolling — which
+        // manifested as severe scroll lag. The blit is a handful of µs.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("glyphon atlas grow blit"),
+        });
+        encoder.copy_texture_to_texture(
+            TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyTextureInfo {
+                texture: &new_texture,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            Extent3d {
+                width: old_size,
+                height: old_size,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
 
-            let image = cache.get_image_uncached(font_system, cache_key).unwrap();
-
-            let width = image.placement.width as usize;
-            let height = image.placement.height as usize;
-
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &self.texture,
-                    mip_level: 0,
-                    origin: Origin3d {
-                        x: x as u32,
-                        y: y as u32,
-                        z: 0,
-                    },
-                    aspect: TextureAspect::All,
-                },
-                &image.data,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width as u32 * self.kind.num_channels() as u32),
-                    rows_per_image: None,
-                },
-                Extent3d {
-                    width: width as u32,
-                    height: height as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
+        self.texture = new_texture;
         self.texture_view = self.texture.create_view(&TextureViewDescriptor::default());
         self.size = new_size;
 
