@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0 OR Zlib"
 [dependencies]
 wgpu = { git = "https://github.com/playtron-os/wgpu.git", rev = "1b9a82c33", default-features = false, features = ["wgsl"] }
 etagere = "0.2"
-cosmic-text = { git = "https://github.com/playtron-os/cosmic-text.git", rev = "0235fc76a8350daa4106a67b13f88ab544ed8079" }
+cosmic-text = { git = "https://github.com/playtron-os/cosmic-text.git", rev = "f1791a34a0f888442d343b0c4403f9eed9cf12f5" }
 lru = { version = "0.16", default-features = false }
 rustc-hash = "2"
 
